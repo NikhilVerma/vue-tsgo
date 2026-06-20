@@ -80,9 +80,28 @@ RootChild:
 		if el.Tag == "style" {
 			isScoped := false
 			for _, prop := range el.Props {
-				if prop.Kind == vue_ast.KindAttribute && prop.AsAttribute().Name == "scoped" {
-					isScoped = true
-					break
+				if prop.Kind == vue_ast.KindAttribute {
+					attr := prop.AsAttribute()
+					if attr.Name == "scoped" {
+						isScoped = true
+					}
+					if attr.Name == "module" {
+						// bare `module` → "$style"; `module="css"` → "css"
+						name := "$style"
+						if attr.Value != nil && attr.Value.Content != "" {
+							name = attr.Value.Content
+						}
+						alreadySeen := false
+						for _, existing := range ctx.cssModules {
+							if existing == name {
+								alreadySeen = true
+								break
+							}
+						}
+						if !alreadySeen {
+							ctx.cssModules = append(ctx.cssModules, name)
+						}
+					}
 				}
 			}
 			if isScoped {
@@ -116,6 +135,10 @@ type codegenCtx struct {
 	templateHasSlots        bool
 	hasScopedStyle          bool
 	cssClasses              []string // CSS class selectors from <style scoped>
+	// cssModules holds the binding names injected by <style module> blocks:
+	// bare `module` → "$style"; `module="css"` → "css". Deduped, in source order.
+	// These are exposed on __VLS_ctx so templates can reference `css.foo` etc.
+	cssModules []string
 	// usedTemplateVars tracks variables referenced in the template for the
 	// // @ts-ignore [var1,var2,...]; block that Volar emits after template codegen.
 	usedTemplateVars []string
@@ -273,6 +296,25 @@ func (c *codegenCtx) mergeTemplateOutput(t templateOutput) {
 	c.usedTemplateVars = t.usedTemplateVars
 	c.allAccessedVars = t.allAccessedVars
 	c.internalVariableCounter = t.internalVarCount
+}
+
+// cssModulesObjectType returns a TS object type literal describing the CSS module
+// bindings injected by <style module> blocks, e.g.
+// "{ css: Record<string, string>; $style: Record<string, string>; }", or "" when
+// there are none. Record<string, string> matches Volar's non-strict default
+// (any class name resolves to a string), which is what this project relies on.
+func (c *codegenCtx) cssModulesObjectType() string {
+	if len(c.cssModules) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("{ ")
+	for _, name := range c.cssModules {
+		b.WriteString(name)
+		b.WriteString(": Record<string, string>; ")
+	}
+	b.WriteString("}")
+	return b.String()
 }
 
 func (c *codegenCtx) reportDiagnostic(loc core.TextRange, message *diagnostics.Message, args ...any) {

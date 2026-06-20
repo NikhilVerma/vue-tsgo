@@ -493,6 +493,12 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 		if hasSetupExposed {
 			c.serviceText.WriteString("...{} as __VLS_SetupExposed,\n")
 		}
+		// <style module> bindings ($style / named) so the template can use `css.foo`
+		if cssType := c.cssModulesObjectType(); cssType != "" {
+			c.serviceText.WriteString("...{} as ")
+			c.serviceText.WriteString(cssType)
+			c.serviceText.WriteString(",\n")
+		}
 		c.serviceText.WriteString("};\n")
 
 		// Component and directive type declarations
@@ -664,14 +670,22 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 		c.serviceText.WriteString("// @ts-ignore\ndeclare const { defineProps, defineSlots, defineEmits, defineExpose, defineModel, defineOptions, withDefaults, }: typeof import('vue');\n")
 
 		// Context — for non-script-setup, Volar uses a simple assignment instead of spread
+		cssIntersection := ""
+		if cssType := c.cssModulesObjectType(); cssType != "" {
+			cssIntersection = " & " + cssType
+		}
 		if selfType != "" {
 			c.serviceText.WriteString("const __VLS_ctx = {} as InstanceType<__VLS_PickNotAny<typeof ")
 			c.serviceText.WriteString(selfType)
 			c.serviceText.WriteString(" extends new () => {} ? typeof ")
 			c.serviceText.WriteString(selfType)
-			c.serviceText.WriteString(" : new () => {}, new () => {}>>;\n")
+			c.serviceText.WriteString(" : new () => {}, new () => {}>>")
+			c.serviceText.WriteString(cssIntersection)
+			c.serviceText.WriteString(";\n")
 		} else {
-			c.serviceText.WriteString("const __VLS_ctx = {} as import('vue').ComponentPublicInstance;\n")
+			c.serviceText.WriteString("const __VLS_ctx = {} as import('vue').ComponentPublicInstance")
+			c.serviceText.WriteString(cssIntersection)
+			c.serviceText.WriteString(";\n")
 		}
 
 		// Component and directive type declarations
