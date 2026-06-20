@@ -81,6 +81,15 @@ func generateTemplate(base *codegenCtx, el *vue_ast.ElementNode) {
 	c := newTemplateCodegenCtx(base)
 	// Push a top-level scope for tracking used vars
 	c.usedVarScopeDepth = 1
+
+	// CSS v-bind(): emit each bound expression (with __VLS_ctx. prefixing) so its
+	// referenced variables are type-checked and tracked as used. Volar emits these
+	// in template scope, before the elements.
+	for _, vbind := range c.cssVBinds {
+		c.serviceText.WriteString("( ")
+		c.mapExpressionInNonBindingPositionTrimmed(vbind)
+		c.serviceText.WriteString(" );\n")
+	}
 	if el != nil {
 		// Count non-comment, non-whitespace root children for single-root detection
 		for _, child := range el.Children {
@@ -811,6 +820,9 @@ func (c *templateCodegenCtx) generateSlotTypes() {
 		c.slotProps[i].propsVar = nextVar
 	}
 
+	// Build the intersection as `{} & {...} & {...};` — a single declaration.
+	// A `;` after each member (instead of only at the end) would terminate the
+	// type after the first member, making the rest a syntax error (multi-slot).
 	c.serviceText.WriteString("type __VLS_Slots = {}\n")
 	for _, sp := range c.slotProps {
 		c.serviceText.WriteString("& { ")
@@ -823,8 +835,9 @@ func (c *templateCodegenCtx) generateSlotTypes() {
 		}
 		c.serviceText.WriteString("?: (props: typeof ")
 		c.serviceText.WriteString(sp.propsVar)
-		c.serviceText.WriteString(") => any };\n")
+		c.serviceText.WriteString(") => any }\n")
 	}
+	c.serviceText.WriteString(";\n")
 }
 
 type expressionMapper struct {
@@ -1258,21 +1271,24 @@ func getStaticClassName(elem *vue_ast.ElementNode) string {
 // emitScopedClassAssertion emits /** @type {__VLS_StyleScopedClasses['class']} */; after an element
 // with a class attribute, when a scoped style block exists.
 func (c *templateCodegenCtx) emitScopedClassAssertion(elem *vue_ast.ElementNode) {
-	className := getStaticClassName(elem)
-	if className == "" {
+	classAttr := getStaticClassName(elem)
+	if classAttr == "" {
 		return
 	}
-	// Track class for __VLS_StyleScopedClasses type definition
-	if c.scopedClassesSet == nil {
-		c.scopedClassesSet = map[string]bool{}
+	// A class attribute may list several space-separated classes; Volar emits one
+	// assertion per class so each is checked against the scoped <style> classes.
+	for _, className := range strings.Fields(classAttr) {
+		if c.scopedClassesSet == nil {
+			c.scopedClassesSet = map[string]bool{}
+		}
+		if !c.scopedClassesSet[className] {
+			c.scopedClassesSet[className] = true
+			c.scopedClasses = append(c.scopedClasses, className)
+		}
+		c.serviceText.WriteString("/** @type {__VLS_StyleScopedClasses['")
+		c.serviceText.WriteString(className)
+		c.serviceText.WriteString("']} */;\n")
 	}
-	if !c.scopedClassesSet[className] {
-		c.scopedClassesSet[className] = true
-		c.scopedClasses = append(c.scopedClasses, className)
-	}
-	c.serviceText.WriteString("/** @type {__VLS_StyleScopedClasses['")
-	c.serviceText.WriteString(className)
-	c.serviceText.WriteString("']} */;\n")
 }
 
 // trackRefAttribute tracks ref attributes on elements for __VLS_TemplateRefs type.
@@ -1402,8 +1418,10 @@ func (c *templateCodegenCtx) generateSingleProp(prop *vue_ast.Node, elem *vue_as
 		if !isBind && !isModel {
 			break
 		}
-		// Skip v-model without argument - it's handled as standalone getter in generateVModelGetter
-		if isModel && dir.Arg == "" {
+		// Native-element v-model without arg is emitted as a standalone getter
+		// (generateVModelGetter). Components instead get an explicit `modelValue`
+		// prop binding here, matching Volar.
+		if isModel && dir.Arg == "" && !isComponent {
 			break
 		}
 		if isBind && dir.Arg == "" {

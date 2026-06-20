@@ -945,6 +945,7 @@ func (t *Tokenizer) stateInEntity() {
 func (t *Tokenizer) parse() {
 	for t.index < len(t.buffer) {
 		c, size := utf8.DecodeRuneInString(t.buffer[t.index:])
+		startIndex := t.index
 		if c == CharCodeNewLine && t.state != StateInEntity {
 			// TODO:
 			// t.newlines.push(t.index)
@@ -1121,7 +1122,17 @@ func (t *Tokenizer) parse() {
 				break
 			}
 		}
-		t.index += size
+		// Normally advance by the decoded rune size so multibyte (e.g. CJK)
+		// characters aren't split. But if a state handler repositioned the index
+		// — only fastForwardTo does, landing on an ASCII delimiter like `<` or `-`
+		// — advance one byte past it, matching the upstream JS tokenizer's
+		// `index++` contract. Using the stale rune size there would overshoot the
+		// delimiter (e.g. skip past `-->`), e.g. on comments containing CJK text.
+		if t.index == startIndex {
+			t.index += size
+		} else {
+			t.index++
+		}
 	}
 	t.cleanup()
 	t.finish()

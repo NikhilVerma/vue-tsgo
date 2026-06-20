@@ -11,6 +11,7 @@ import (
 	"github.com/NikhilVerma/vue-tsgo/internal/utils"
 	"github.com/NikhilVerma/vue-tsgo/internal/vue/ast"
 	"github.com/NikhilVerma/vue-tsgo/internal/vue/diagnostics"
+	"github.com/NikhilVerma/vue-tsgo/internal/vue/parser"
 	"github.com/microsoft/typescript-go/shim/ast"
 	"github.com/microsoft/typescript-go/shim/core"
 	"github.com/microsoft/typescript-go/shim/diagnostics"
@@ -80,9 +81,28 @@ RootChild:
 		if el.Tag == "style" {
 			isScoped := false
 			for _, prop := range el.Props {
-				if prop.Kind == vue_ast.KindAttribute && prop.AsAttribute().Name == "scoped" {
-					isScoped = true
-					break
+				if prop.Kind == vue_ast.KindAttribute {
+					attr := prop.AsAttribute()
+					if attr.Name == "scoped" {
+						isScoped = true
+					}
+					if attr.Name == "module" {
+						// bare `module` → "$style"; `module="css"` → "css"
+						name := "$style"
+						if attr.Value != nil && attr.Value.Content != "" {
+							name = attr.Value.Content
+						}
+						alreadySeen := false
+						for _, existing := range ctx.cssModules {
+							if existing == name {
+								alreadySeen = true
+								break
+							}
+						}
+						if !alreadySeen {
+							ctx.cssModules = append(ctx.cssModules, name)
+						}
+					}
 				}
 			}
 			if isScoped {
@@ -92,6 +112,11 @@ RootChild:
 					cssContent := el.Children[0].AsText().Content
 					ctx.cssClasses = extractCSSClasses(cssContent)
 				}
+			}
+			// v-bind(expr) works in any <style> block (scoped or not).
+			if len(el.Children) > 0 && el.Children[0].Kind == vue_ast.KindText {
+				txt := el.Children[0].AsText()
+				ctx.cssVBinds = append(ctx.cssVBinds, extractCssVBinds(txt.Content, txt.Loc.Pos())...)
 			}
 		}
 	}
@@ -116,6 +141,14 @@ type codegenCtx struct {
 	templateHasSlots        bool
 	hasScopedStyle          bool
 	cssClasses              []string // CSS class selectors from <style scoped>
+	// cssModules holds the binding names injected by <style module> blocks:
+	// bare `module` → "$style"; `module="css"` → "css". Deduped, in source order.
+	// These are exposed on __VLS_ctx so templates can reference `css.foo` etc.
+	cssModules []string
+	// cssVBinds holds the expressions found in `v-bind(...)` inside <style> blocks.
+	// They're emitted (with __VLS_ctx. prefixing) so the bound variables are
+	// type-checked and tracked as used, matching Volar.
+	cssVBinds []*vue_ast.SimpleExpressionNode
 	// usedTemplateVars tracks variables referenced in the template for the
 	// // @ts-ignore [var1,var2,...]; block that Volar emits after template codegen.
 	usedTemplateVars []string
@@ -225,6 +258,7 @@ func generateTemplateBuffered(base *codegenCtx, el *vue_ast.ElementNode) templat
 		options:                 base.options,
 		hasScopedStyle:          base.hasScopedStyle,
 		setupBindings:           base.setupBindings,
+		cssVBinds:               base.cssVBinds,
 	}
 	generateTemplate(&tmpCtx, el)
 	return templateOutput{
@@ -273,6 +307,25 @@ func (c *codegenCtx) mergeTemplateOutput(t templateOutput) {
 	c.usedTemplateVars = t.usedTemplateVars
 	c.allAccessedVars = t.allAccessedVars
 	c.internalVariableCounter = t.internalVarCount
+}
+
+// cssModulesObjectType returns a TS object type literal describing the CSS module
+// bindings injected by <style module> blocks, e.g.
+// "{ css: Record<string, string>; $style: Record<string, string>; }", or "" when
+// there are none. Record<string, string> matches Volar's non-strict default
+// (any class name resolves to a string), which is what this project relies on.
+func (c *codegenCtx) cssModulesObjectType() string {
+	if len(c.cssModules) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("{ ")
+	for _, name := range c.cssModules {
+		b.WriteString(name)
+		b.WriteString(": Record<string, string>; ")
+	}
+	b.WriteString("}")
+	return b.String()
 }
 
 func (c *codegenCtx) reportDiagnostic(loc core.TextRange, message *diagnostics.Message, args ...any) {
@@ -334,6 +387,77 @@ func (c *codegenCtx) newInternalVariable() string {
 
 // cssClassSelectorRe matches CSS class selectors like .foo-bar
 var cssClassSelectorRe = regexp.MustCompile(`\.([\w-]+)`)
+
+// extractCssVBinds finds `v-bind(<expr>)` occurrences in CSS text and builds an
+// expression node for each, with a source range pointing back into the style
+// block (baseOffset is the absolute offset of cssText in the SFC). Matches
+// quoting/nesting; a quoted argument (`v-bind('a + "b"')`) has its string
+// content treated as the expression, like Vue.
+func extractCssVBinds(cssText string, baseOffset int) []*vue_ast.SimpleExpressionNode {
+	const marker = "v-bind("
+	var result []*vue_ast.SimpleExpressionNode
+	n := len(cssText)
+	i := 0
+	for i < n {
+		rel := strings.Index(cssText[i:], marker)
+		if rel < 0 {
+			break
+		}
+		start := i + rel + len(marker)
+		// Find the matching close paren, respecting nested parens and quotes.
+		depth := 1
+		var quote byte
+		j := start
+		for j < n {
+			ch := cssText[j]
+			switch {
+			case quote != 0:
+				if ch == quote {
+					quote = 0
+				}
+			case ch == '\'' || ch == '"':
+				quote = ch
+			case ch == '(':
+				depth++
+			case ch == ')':
+				depth--
+			}
+			if depth == 0 {
+				break
+			}
+			j++
+		}
+		if j >= n {
+			break // unmatched paren
+		}
+		argStart, argEnd := start, j
+		trim := func(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+		for argStart < argEnd && trim(cssText[argStart]) {
+			argStart++
+		}
+		for argEnd > argStart && trim(cssText[argEnd-1]) {
+			argEnd--
+		}
+		// Unwrap a quoted argument: its string content is the expression.
+		if argEnd-argStart >= 2 {
+			q := cssText[argStart]
+			if (q == '\'' || q == '"') && cssText[argEnd-1] == q {
+				argStart++
+				argEnd--
+			}
+		}
+		if argEnd > argStart {
+			exprText := cssText[argStart:argEnd]
+			result = append(result, vue_ast.NewSimpleExpressionNode(
+				vue_parser.ParseTsAst("("+exprText+")"),
+				core.NewTextRange(baseOffset+argStart, baseOffset+argEnd),
+				1, 1,
+			))
+		}
+		i = j + 1
+	}
+	return result
+}
 
 // extractCSSClasses extracts class names from CSS content, preserving order and deduplicating.
 func extractCSSClasses(css string) []string {

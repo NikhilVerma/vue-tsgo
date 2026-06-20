@@ -98,6 +98,7 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 
 	if c.scriptSetupEl != nil {
 		hasGeneric := false
+		var genericText string
 		for _, prop := range c.scriptSetupEl.Props {
 			if prop.Kind != vue_ast.KindAttribute {
 				continue
@@ -110,8 +111,22 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 					break
 				}
 				hasGeneric = true
-				_ = hasGeneric // TODO: generic support
+				genericText = attr.Value.Content
 			}
+		}
+
+		// Generic SFC: wrap the entire setup + template body in a generic arrow
+		// function so the `generic="T extends ..."` type parameters are in scope
+		// throughout (props type, ctx, template). Matches Volar's codegen; the
+		// matching close + export is emitted at the "Export" section below.
+		if hasGeneric {
+			c.serviceText.WriteString("const __VLS_export = (<")
+			c.serviceText.WriteString(genericText)
+			c.serviceText.WriteString(",>(\n")
+			c.serviceText.WriteString("\t__VLS_props: NonNullable<Awaited<typeof __VLS_setup>>['props'],\n")
+			c.serviceText.WriteString("\t__VLS_ctx?: __VLS_PrettifyLocal<Pick<NonNullable<Awaited<typeof __VLS_setup>>, 'attrs' | 'emit' | 'slots'>>,\n")
+			c.serviceText.WriteString("\t__VLS_exposed?: NonNullable<Awaited<typeof __VLS_setup>>['expose'],\n")
+			c.serviceText.WriteString("\t__VLS_setup = (async () => {\n")
 		}
 
 		// Emit script setup content inline (no IIFE wrapper)
@@ -135,6 +150,8 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 			// Track runtime defineProps/defineEmits arguments (for props: {...} in defineComponent)
 			propsRuntimeArg *ast.Node
 			emitsRuntimeArg *ast.Node
+			// withDefaults() second argument (the defaults object literal), if any.
+			defaultsArg *ast.Node
 		)
 
 		// TODO: report nested compiler macros (vue compiler errors on them)
@@ -175,6 +192,8 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 						if len(call.Arguments.Nodes) != 2 || !ast.IsCallExpression(call.Arguments.Nodes[0]) || !ast.IsIdentifier(call.Arguments.Nodes[0].Expression()) || call.Arguments.Nodes[0].Expression().Text() != "defineProps" {
 							break
 						}
+						// Capture the defaults object before unwrapping to the inner defineProps call.
+						defaultsArg = call.Arguments.Nodes[1]
 						call = call.Arguments.Nodes[0].AsCallExpression()
 						callee = call.Expression
 						calleeName = callee.Text()
@@ -361,6 +380,14 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 		}
 		c.serviceText.WriteString("defineOptions, withDefaults, }: typeof import('vue');\n")
 
+		// withDefaults(): expose the defaults object so defineComponent can wire
+		// it via __defaults (matches Volar).
+		if defaultsArg != nil {
+			c.serviceText.WriteString("const __VLS_defaults = ")
+			c.mapTextFrom(defaultsArg, c.scriptSetupEl.Ast, innerStart)
+			c.serviceText.WriteString(";\n")
+		}
+
 		// Emit consolidated model types (Volar-style: __VLS_ModelProps, __VLS_ModelEmit, __VLS_modelEmit)
 		c.emitModelTypes()
 
@@ -493,6 +520,12 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 		if hasSetupExposed {
 			c.serviceText.WriteString("...{} as __VLS_SetupExposed,\n")
 		}
+		// <style module> bindings ($style / named) so the template can use `css.foo`
+		if cssType := c.cssModulesObjectType(); cssType != "" {
+			c.serviceText.WriteString("...{} as ")
+			c.serviceText.WriteString(cssType)
+			c.serviceText.WriteString(",\n")
+		}
 		c.serviceText.WriteString("};\n")
 
 		// Component and directive type declarations
@@ -538,8 +571,23 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 
 		// Export
 		if hasGeneric {
-			// TODO: generic export pattern
-			c.serviceText.WriteString("const __VLS_export = (await import('vue')).defineComponent({\n});\nexport default {} as typeof __VLS_export;\n")
+			// Close the generic setup wrapper opened above: return the component's
+			// props/expose/attrs/slots/emit shape, then export the generic factory.
+			c.serviceText.WriteString("return {} as {\n")
+			c.serviceText.WriteString("\tprops: import('vue').PublicProps")
+			if hasPublicProps {
+				c.serviceText.WriteString(" & __VLS_PrettifyLocal<__VLS_PublicProps>")
+			}
+			c.serviceText.WriteString(" & (typeof globalThis extends { __VLS_PROPS_FALLBACK: infer P } ? P : {});\n")
+			c.serviceText.WriteString("\texpose: (exposed: {}) => void;\n")
+			c.serviceText.WriteString("\tattrs: any;\n")
+			c.serviceText.WriteString("\tslots: {};\n")
+			c.serviceText.WriteString("\temit: {};\n")
+			c.serviceText.WriteString("};\n")
+			c.serviceText.WriteString("})(),\n")
+			c.serviceText.WriteString(") => ({} as import('vue').VNode & { __ctx?: Awaited<typeof __VLS_setup> }));\n")
+			c.serviceText.WriteString("export default {} as typeof __VLS_export;\n")
+			c.serviceText.WriteString("type __VLS_PrettifyLocal<T> = (T extends any ? { [K in keyof T]: T[K]; } : { [K in keyof T as K]: T[K]; }) & {};\n")
 		} else {
 			hasSlots := slotsVariableName != "" || c.templateHasSlots
 			hasDefineComponentOptions := hasPublicProps || propsRuntimeArg != nil || hasPublicEmits || hasExpose
@@ -587,6 +635,10 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 						c.mapTextFrom(propsRuntimeArg, c.scriptSetupEl.Ast, innerStart)
 						c.serviceText.WriteString(",\n")
 					} else if hasTypeProps {
+						// withDefaults(): wire the defaults object (before __typeProps, per Volar).
+						if defaultsArg != nil {
+							c.serviceText.WriteString("__defaults: __VLS_defaults,\n")
+						}
 						// Type-only props (no runtime): emit __typeProps for Vue 3.5+
 						if c.options.Version.supportsTypeProps() {
 							c.serviceText.WriteString("__typeProps: {} as __VLS_PublicProps,\n")
@@ -642,6 +694,10 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 						c.mapTextFrom(propsRuntimeArg, c.scriptSetupEl.Ast, innerStart)
 						c.serviceText.WriteString(",\n")
 					} else if hasTypeProps {
+						// withDefaults(): wire the defaults object (before __typeProps, per Volar).
+						if defaultsArg != nil {
+							c.serviceText.WriteString("__defaults: __VLS_defaults,\n")
+						}
 						// Type-only props (no runtime): emit __typeProps for Vue 3.5+
 						if c.options.Version.supportsTypeProps() {
 							c.serviceText.WriteString("__typeProps: {} as __VLS_PublicProps,\n")
@@ -664,14 +720,22 @@ func generateScript(base *codegenCtx, scriptSetupEl *vue_ast.ElementNode, script
 		c.serviceText.WriteString("// @ts-ignore\ndeclare const { defineProps, defineSlots, defineEmits, defineExpose, defineModel, defineOptions, withDefaults, }: typeof import('vue');\n")
 
 		// Context — for non-script-setup, Volar uses a simple assignment instead of spread
+		cssIntersection := ""
+		if cssType := c.cssModulesObjectType(); cssType != "" {
+			cssIntersection = " & " + cssType
+		}
 		if selfType != "" {
 			c.serviceText.WriteString("const __VLS_ctx = {} as InstanceType<__VLS_PickNotAny<typeof ")
 			c.serviceText.WriteString(selfType)
 			c.serviceText.WriteString(" extends new () => {} ? typeof ")
 			c.serviceText.WriteString(selfType)
-			c.serviceText.WriteString(" : new () => {}, new () => {}>>;\n")
+			c.serviceText.WriteString(" : new () => {}, new () => {}>>")
+			c.serviceText.WriteString(cssIntersection)
+			c.serviceText.WriteString(";\n")
 		} else {
-			c.serviceText.WriteString("const __VLS_ctx = {} as import('vue').ComponentPublicInstance;\n")
+			c.serviceText.WriteString("const __VLS_ctx = {} as import('vue').ComponentPublicInstance")
+			c.serviceText.WriteString(cssIntersection)
+			c.serviceText.WriteString(";\n")
 		}
 
 		// Component and directive type declarations
